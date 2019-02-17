@@ -1,0 +1,641 @@
+---
+title: "Untitled"
+author: "Chitra Venkatesh"
+date: "August 14, 2018"
+output: html_document
+---
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(corrplot) #for function corrplot()
+library(caret) #for createFolds() in CV
+library(e1071) #for naive Bayes()
+library(rpart) #for decision trees
+library(tree)
+library(randomForest) #for radomForest()
+library(rqPen) #for square()
+library(parallelSVM) 
+library(adabag) #for boosting
+```
+
+
+
+#Full dataset loaded
+
+```{r}
+set.seed(5)
+Full_Data = read.csv("C://Users//gowth//Desktop//Chitra//STATS 202//Project//Dataset//training.csv")
+```
+
+#Test and Training data split by Query ID (30% Query IDs for Test assigned randomly)
+
+```{r}
+set.seed(5)
+unique_query = unique(Full_Data$query_id)
+index = sample(length(unique_query), round(length(unique_query)/3), replace = FALSE)
+test_QueryID = unique_query[index]
+train_QueryID = unique_query[-index]
+
+trainer = data.frame(Full_Data[Full_Data$query_id %in% train_QueryID,])
+test = data.frame(Full_Data[Full_Data$query_id %in% test_QueryID,])
+```
+
+
+# function for inserting engineered features and transforming data
+
+```{r}
+FeatureInclusion = function(D, index)
+{
+ #creating blank space in dataframe to include two new features NumHP, Popularity
+ D[,index+1] = rep(0, nrow(D))
+ D[,index+2] = rep(0, nrow(D))
+ D[,index+3] = rep(0, nrow(D))
+ D[,index+4] = rep(0, nrow(D))
+ D[,index+5] = rep(0, nrow(D))
+ D[,index+6] = rep(0, nrow(D))
+ D[,index+7] = rep(0, nrow(D))
+ 
+ names(D)[index+1] = "NumHp"
+ names(D)[index+2] = "Popularity" 
+ names(D)[index+3] = "Sig7_Query"
+ names(D)[index+4] = "Sig8_Query"
+ names(D)[index+5] = "Sig1_Query"
+ names(D)[index+6] = "Sig2_Query"
+ names(D)[index+7] = "SumSig345"
+ 
+ #for every unique query_id, NumHP and Popularity is calculated and appended to dataframe as new columns
+ 
+ unique_query = unique(D$query_id)
+ 
+ 
+ D$SumSig345 = log(1+D$sig3) + log(1+D$sig4) + log(1+D$sig5)
+ D$SumSig345 = (D$SumSig345 - min(D$SumSig345))/(max(D$SumSig345) - min(D$SumSig345))
+
+ #normalizing all signals using z transformation - sig1 to sig8
+ for(i in 5:12)
+ {
+   D[,i] = (D[,i] - mean(D[,i]))/sd(D[,i])
+ }
+ 
+ for(i in 1:length(unique_query))
+ {
+  D$NumHp[D$query_id == unique_query[i]] = sum(D$is_homepage[D$query_id == unique_query[i]])
+  
+  D$Popularity[D$query_id == unique_query[i]] = nrow(D[D$query_id == unique_query[i],])
+  
+  D$Sig7_Query[D$query_id == unique_query[i]] = mean(D$sig7[D$query_id == unique_query[i]])
+ 
+  D$Sig8_Query[D$query_id == unique_query[i]] = mean(D$sig8[D$query_id == unique_query[i]])
+  
+  D$Sig1_Query[D$query_id == unique_query[i]] = mean(D$sig1[D$query_id == unique_query[i]])
+  
+  D$Sig2_Query[D$query_id == unique_query[i]] = mean(D$sig2[D$query_id == unique_query[i]])
+  
+  D$SumSig345[D$query_id == unique_query[i]] = mean(D$SumSig345[D$query_id == unique_query[i]])
+ }
+ 
+ D$Popularity = D$Popularity / max(D$Popularity)
+ D$Sig2_Query = D$sig2 - D$Sig2_Query
+ D$Sig1_Query = D$sig1 - D$Sig1_Query
+ D$Sig7_Query = D$sig7 - D$Sig7_Query
+ D$Sig8_Query = D$sig8 - D$Sig8_Query
+ 
+ D = D[,c(3,4,5,6,10,11,12,13,15,16,17,18,19)]
+ 
+ return(D)
+}
+
+```
+
+
+#adding engineered features to dataset
+```{r}
+
+#including new (engineered) features to training data set
+relevance = trainer$relevance
+trainer = cbind(FeatureInclusion(trainer,ncol(trainer)-1),relevance)
+trainer$relevance = as.factor(trainer$relevance)
+trainer$is_homepage = as.factor(trainer$is_homepage)
+
+#including new (engineered features) to test dataset
+relevance = 0 
+relevance = test$relevance
+test = cbind(FeatureInclusion(test, ncol(test)-1), relevance)
+test$relevance = as.factor(test$relevance)
+test$is_homepage = as.factor(test$is_homepage)
+```
+
+
+#function for returning confusion matrix
+
+```{r}
+contingencyTable = function(P, relevance)
+{
+  m = matrix(c(0,0,0,0), nrow = 2, ncol = 2)
+  colnames(m) = c("Actual 1", "Actual 0")
+  rownames(m) = c("Predicted 1", "Predicted 0")
+  m[1,1] = sum(P == 1 & relevance ==1)
+  m[2,1] = sum(P == 0 & relevance ==1)
+  m[1,2] = sum(P == 1 & relevance ==0)
+  m[2,2] = sum(P == 0 & relevance ==0)
+  
+  return(m)
+}
+```
+
+#Creating k = 3 folds for cross validation
+
+```{r}
+set.seed(1)
+FOLD = 3
+k = createFolds(trainer$relevance, FOLD)
+
+```
+
+
+#Logistic Regression using 3-fold CV
+
+```{r}
+set.seed(10)
+
+Get_accuracy = function(te, LR)
+{
+ P = predict(LR, newdata = te, type = "response", positive = 1)
+ 
+ P[P>=0.5] = 1
+ P[P<0.5] = 0
+ 
+ return((sum(P == te$relevance)*1.0/nrow(te)))
+ #return (c((sum(P == te$relevance)*1.0/nrow(te)), (1 - sum(P==1 & te$relevance ==1)/sum(te$relevance == 1)), (sum(P == 1 & te$relevance == 0)/sum(te$relevance ==0))))
+}
+
+errorLR = rep(0,FOLD)
+errorNB = rep(0,FOLD)
+
+for(i in 1:FOLD)
+{
+
+ t = trainer[-k[[i]],]
+ te = trainer[k[[i]],]
+ print(paste('Iteration', i))
+ 
+
+ #LR = glm(formula = (relevance == 1) ~ query_length + sig1 + sig2 +  sig6 +  sig7 + sig8 + NumHp + Popularity + Sig1_Query + Sig2_Query + Sig7_Query + Sig8_Query + SumSig345, family = binomial, data = t)
+ LR = glm(formula = (relevance == 1) ~., family = binomial, data = t)
+ 
+ print(paste('Train Accuracy', Get_accuracy(t, LR)))
+ print(paste('Test Accuracy', Get_accuracy(te, LR)))
+ errorLR[i] = Get_accuracy(te, LR)
+}
+
+mean(errorLR)
+
+P = predict(LR, newdata = te, type = "response", positive = 1)
+P[P>=0.5] = 1
+P[P<0.5] = 0
+
+summary(LR)
+contingencyTable(P, te$relevance)
+
+```
+
+Testing Accuracy
+
+```{r}
+LR = glm(formula = (relevance == 1) ~., family = binomial, data = trainer)
+summary(LR)
+Get_accuracy(test,LR)
+P = predict(LR, newdata = test, type = "response", positive = 1)
+P[P>=0.5] = 1
+P[P<0.5] = 0
+
+summary(LR)
+contingencyTable(P, test$relevance)
+
+```
+
+
+#Naive Bayes Method
+
+```{r}
+set.seed(10)
+for(i in 1:FOLD)
+{
+
+ t = trainer[-k[[i]],]
+ te = trainer[k[[i]],]
+ print(paste('Iteration', i))
+ 
+ NB = naiveBayes(t$relevance ~., data = t)
+ #NB = train(t$relevance ~., data = t, method = "nb")
+ 
+ P = predict(NB, t, type = "class", positive = 1)
+ print(paste('Train Accuracy', (sum(P == t$relevance)*1.0/nrow(t))))
+ 
+ P = predict(NB, te, type = "class", positive = 1)
+ print(paste('Test Accuracy', (sum(P == te$relevance)*1.0/nrow(te))))
+ errorNB[i] = (sum(P == te$relevance)*1.0/nrow(te))
+ }
+
+mean(errorNB)
+
+```
+
+Testing Accuracy
+```{r}
+NB = naiveBayes(trainer$relevance ~., data = trainer)
+P = predict(NB, test, type = "class", positive = 1)
+sum(P == test$relevance)*1.0/nrow(test)
+1 - sum(P==1 & test$relevance ==1)/sum(test$relevance == 1)
+sum(P == 1 & test$relevance == 0)/sum(test$relevance ==0)
+print(paste('Test Error', 1 - (sum(P == test$relevance)*1.0/nrow(test))))
+
+contingencyTable(P,test$relevance)
+```
+
+
+
+#Decision Tree
+
+#Method 1: Only choose those splits that lead to error reduction defined by control otherwise dont split/grow the tree in that direction.
+#For different values of control variable, test error is computed by K-folds cross validation. The value of control variable with the least value of error is considered for the final tree.
+
+```{r}
+set.seed(10)
+
+DT_error = rep(0, FOLD)
+threshold = exp(seq(log(0.0001), log(0.01), length.out = 10))
+Error_Control = data.frame(rep(0,length(threshold)),rep(0,length(threshold)))
+colnames(Error_Control) = c("Threshold","Accuracy")
+#1st for-loop is to find the value of control with the best accuracy
+
+for(c in 1:length(threshold))
+{
+ 
+ for(i in 1:FOLD)
+ {
+  t = trainer[-k[[i]],]
+  te = trainer[k[[i]],]
+  print(paste('Iteration', i))
+
+  DT = rpart(relevance ~., data = t, method = "class", control = rpart.control(cp = threshold[c]))
+  P = predict(DT, te, type = "class", control = rpart.control(cp = threshold[c]))
+  print(paste("Test Error", sum(P==te$relevance)/nrow(te)))
+  DT_error[i] = sum(P==te$relevance)/nrow(te)
+ }
+ Error_Control[c,] = c(threshold[c], mean(DT_error))
+}
+
+plot(x = Error_Control[,1], y = (1-Error_Control[,2]), log = "x", main = paste("K-Folds test error with changes in control parameter (Lowest error)", 1- max(Error_Control$Accuracy)), xlab = "Value of Threshold", ylab = "Value of Error (1 - K-fold Test Error)", sub = "Blue line indicates lowest k-fold test error for a specific threshold")
+abline(v = Error_Control$Threshold[Error_Control$Accuracy == max(Error_Control$Accuracy)], col = "blue")
+
+control_Tree = Error_Control$Threshold[Error_Control$Accuracy == max(Error_Control$Accuracy)]
+
+```
+
+#Decision tress using the chosen control (0.000464)
+
+```{r}
+ DT = rpart(relevance ~., data = trainer, method = "class", control = rpart.control(cp = control_Tree))
+summary(DT)
+plot(DT)
+text(DT, pretty = 0, cex = 0.5)
+```
+
+Error of test set
+
+```{r}
+P = predict(DT, test, type = "class", control = rpart.control(cp = control_Tree))
+print(paste("Test Error", 1 - sum(P==test$relevance)/nrow(test)))
+```
+
+```{r}
+sum(P == test$relevance)*1.0/nrow(test)
+1 - sum(P==1 & test$relevance ==1)/sum(test$relevance == 1)
+sum(P == 1 & test$relevance == 0)/sum(test$relevance ==0)
+
+contingencyTable(P,test$relevance)
+
+```
+
+
+#Method 2: Grow completely, then prune. In this case the cp value with lowest error is 0.00033. 
+
+```{r}
+set.seed(5)
+#Tree grown completely with no control parameter
+D_tree2 = rpart(relevance ~., data = trainer, method = "class", control = rpart.control(cp = 0))
+plotcp(D_tree2)
+
+#Tree pruned and best cp value found
+pruned_tree = prune(D_tree2, cp = D_tree2$cptable[which.min(D_tree2$cptable[,"xerror"]),"CP"])
+
+BestCP = D_tree2$cptable[which.min(D_tree2$cptable[,"xerror"]),"CP"] 
+
+plot(pruned_tree,  main = paste("Pruned Tree with best cp =", round(BestCP,5)))
+text(pruned_tree, cex = 0.5)
+```
+
+```{r}
+
+
+P = predict(pruned_tree, trainer, type = "class", control = rpart.control(cp = BestCP))
+print(paste("cross val Error", 1 -sum(P==trainer$relevance)/nrow(trainer)))
+
+P = predict(pruned_tree, test, type = "class", control = rpart.control(cp = BestCP))
+print(paste("Test Error", 1 -sum(P==test$relevance)/nrow(test)))
+
+sum(P == test$relevance)*1.0/nrow(test)
+1 - sum(P==1 & test$relevance ==1)/sum(test$relevance == 1)
+sum(P == 1 & test$relevance == 0)/sum(test$relevance ==0)
+
+contingencyTable(P,test$relevance)
+
+
+```
+
+#Random Forest
+
+
+```{r}
+set.seed(5)
+Max_m = 6
+error_RF = rep(0, FOLD)
+ErrorRFModels = rep(0, Max_m)
+
+for(m in 2:Max_m)
+{
+for(i in 1:FOLD)
+{
+ t = trainer[-k[[i]],]
+ te = trainer[k[[i]],]
+ print(paste('Iteration', i)) 
+ 
+ RF = randomForest(relevance ~., data = t, mtry = m)
+ #plot(RF)
+ #P = predict(RF, t, type = "class")
+ #print(paste("Training Error: ", sum(P == t$relevance)/nrow(t)))
+ 
+ P = predict(RF, te, type = "class")
+ print(paste("Test Error: ", sum(P == te$relevance)/nrow(te)))
+ error_RF[i] = sum(P == te$relevance)/nrow(te)  
+}
+ErrorRFModels[m] = mean(error_RF)
+}
+ErrorRFModels
+contingencyTable(P, te$relevance)
+plot(x = c(2,3,4,5,6), y = 1-ErrorRFModels[2:6], ylab = "k-fold cross-validation Error Rate", main = "Plot between Errors and different values of m for Random forest", ylim = c(0.30,0.36), type = "b")
+abline(v =2, col = "blue")
+#text(RF)
+```
+
+
+```{r}
+set.seed(5)
+RF = randomForest(relevance ~., data = trainer, mtry = 2)
+P = predict(RF, test, type = "class")
+1 - sum(P == test$relevance)/nrow(test)
+summary(RF)
+
+sum(P == test$relevance)*1.0/nrow(test)
+1 - sum(P==1 & test$relevance ==1)/sum(test$relevance == 1)
+sum(P == 1 & test$relevance == 0)/sum(test$relevance ==0)
+
+contingencyTable(P,test$relevance)
+
+```
+
+
+
+#boosting using boost function
+
+```{r}
+library(gbm)
+
+lambda = (10^seq(-10, -0.2, by = 0.1))
+Error_BT = rep(0, length(lambda))
+E =rep(0, FOLD)
+
+for (j in 1:length(lambda))
+{
+  print(paste('Iteration', j))
+  for(i in 1:FOLD)
+{
+ t = trainer[-k[[i]],]
+ te = trainer[k[[i]],]
+ t$relevance = as.character(t$relevance)
+ te$relevance = as.character(te$relevance)
+ 
+ boost_BT = gbm(relevance ~ ., data = t, n.trees = 1000, shrinkage = lambda[j], distribution = "bernoulli")
+ boost.prob = predict(boost_BT, te, n.trees = 1000, type = "response")
+ boost.pred = ifelse(boost.prob >= 0.5, 1, 0)
+ E[i] = 1 - sum(te$relevance == boost.pred)/nrow(te)
+}
+Error_BT[j] = mean(E)
+}
+
+plot(lambda, (Error_BT), type = "b", xlab = "Shrinkage", ylab = "Cross-validated MSE", main = paste("MSE with changes in lamda, lowest MSE of 33.47 at lambda = ", round(lambda[which.min(Error_BT)],4)))
+abline(v = lambda[which.min(Error_BT)x])
+```
+
+#finding lambda for minimum error for boositng
+
+```{r}
+min(Error_BT)
+lambda[which.min(Error_BT)]
+
+```
+
+#printing boosting
+
+```{r}
+test1 = test
+test1$relevance = as.character(test1$relevance)
+trainer1 = trainer
+trainer1$relevance = as.character(trainer1$relevance)
+
+boost_BT = gbm(relevance ~ ., data = trainer1, n.trees = 1000, shrinkage = lambda[which.min(Error_BT)], distribution = "bernoulli")
+summary(boost_BT)
+
+P = predict(boost_BT, newdata = test1, type = "response", n.trees = 1000)
+P[P>=0.5] = "1"
+P[P<0.5] ="0"
+1-sum(P == test1$relevance)/nrow(test1)
+
+sum(P == test$relevance)*1.0/nrow(test)
+1 - sum(P==1 & test$relevance ==1)/sum(test$relevance == 1)
+sum(P == 1 & test$relevance == 0)/sum(test$relevance ==0)
+
+contingencyTable(P,test$relevance)
+
+```
+
+
+#SVM
+
+```{r}
+set.seed(5)
+
+#g = (10^seq(-4, 1, by = 0.2))
+g <- list(c(0.1,0.001))
+E = rep(0, FOLD)
+errorSVM = rep(0,length(g))
+
+tune.out = tune(parallelSVM, train.x = trainer[,c(1,13)], data = trainer, kernel = "radial", numberCores = 4, ranges = list(cost = 10^seq(-1, 1, by = 0.5), gamma = c(0.01, 0.1)))
+
+tune.out = tune(svm, relevance~., data = trainer[1:5000, ], kernel = "radial", ranges = list(cost = 10^seq(-2,0, by = 0.2),gamma = 10^seq(-2,2, by = 0.2)))
+
+for(j in 1:2)
+{
+  
+for(i in 1:FOLD)
+{
+ t = trainer[-k[[i]],]
+ te = trainer[k[[i]],]
+ print(paste('Iteration', i))
+ 
+ SVM = parallelSVM(relevance ~ .,data = t, kernel = "radial", cost = 10000, gamma = g[1], numberCores=4) 
+ P = predict(SVM, te)
+ E[i] = 1 - sum(P == te$relevance)/nrow(te)
+}
+errorSVM[j] = mean(E)
+}
+plot(g, errorSVM, type = "b", xlab = "Shrinkage", ylab = "Test MSE")
+
+tune.out$performances
+scatter
+require(plotly)
+plot_ly(x=tune.out$performances$cost,y=tune.out$performances$gamma,z=tune.out$performances$error, type="surface")
+```
+
+```{r}
+min(errorSVM)
+g[which.min(errorSVM)]
+```
+
+```{r}
+P_LR = vector()
+P_NB = vector()
+P_DT = vector()
+P_PT = vector()
+P_RF = vector()
+P_BT = vector()
+P_SVM = vector()
+#P_LR = matrix(nrow = 17710, ncol = 3)
+#P_NB = vector()
+#P_DT = vector()
+
+
+  i =1
+  t = trainer[-k[[i]],]
+  te = trainer[k[[i]],]
+  
+  #Logistic Regression
+  LR = glm(formula = (relevance == 1) ~., family = binomial, data = t)
+  P_LR = predict(LR, newdata = te, type = "response", positive = 1)
+  
+  #Naive Bayes
+  NB = naiveBayes(relevance ~., data = t)
+  P_NB = predict(NB, te, type = "raw", positive = 1)[,2]
+   
+  #Decision Tree Method 1
+  DT = rpart(t$relevance ~., data = t, method = "class", control = rpart.control(cp = control_Tree))
+  P_DT = predict(DT, te, type = "prob", control = rpart.control(cp = control_Tree))[,2]
+
+  df = data.frame(P_LR, P_NB, P_DT, te$relevance)
+  colnames(df) = c("lr", "nb", "dt1", "relevance")
+  #Decision Tree Method 2
+  
+  
+  y = glm(formula = (relevance == 1) ~., data = df, family = binomial)
+  P =predict(y, df, type = "response", positive = 1)
+  P[P>=0.5] = 1
+  P[P<0.5] = 0
+  1-sum(P == te$relevance)/nrow(te)
+
+  P1 = predict(LR, test, type = "response" , positive = 1)
+  P2 = predict(NB, test, type = "raw", positive = 1)[,2]
+  P3 = predict(DT, test, type = "prob", control = rpart.control(cp = control_Tree))[,2]
+  df = data.frame(P1,P2,P3)
+  colnames(df) = c("lr", "nb", "dt1")
+P = predict(y,df, type = "response", positive =1)
+ P[P>=0.5] = 1
+  P[P<0.5] = 0
+  1-sum(P == test$relevance)/nrow(test)
+```
+
+#Stacked Moded
+```{r}
+  
+  te1 = te
+  t1 = t
+  te1$relevance = as.character(te1$relevance)
+  t1$relevance = as.character(t1$relevance)
+  
+  #Logistic Regression
+  LR = glm(formula = (relevance == 1) ~., family = binomial, data = trainer)
+  P_LR = predict(LR, newdata = te, type = "response", positive = 1)
+  
+  #Naive Bayes
+  NB = naiveBayes(relevance ~., data = trainer)
+  P_NB = predict(NB, te, type = "raw", positive = 1)[,2]
+   
+  #Decision Tree Method 1
+  DT = rpart(relevance ~., data = trainer, method = "class", control = rpart.control(cp = control_Tree))
+  P_DT = predict(DT, te, type = "prob", control = rpart.control(cp = control_Tree))[,2]
+  
+  #Decision Tree Method 2
+    P_PT = predict(pruned_tree, te, type = "prob", control = rpart.control(cp = BestCP))[,2]
+  
+  #Random Forest
+  P_RF = predict(RF, te, type = "class")
+  
+  #Boosting
+  P_BT = predict(boost_BT, newdata = te, type = "response", n.trees = 1000)
+  
+  #SVM
+  
+  
+  
+  df = data.frame(P_LR, P_NB, P_DT, P_PT, P_RF, P_BT, te$relevance)
+  colnames(df) = c("lr", "nb", "dt1", "dt2", "rf", "bt", "relevance")
+  
+  y = glm(formula = (relevance == 1) ~., data = df, family = binomial)
+  
+  ##REPEAT FOR TEST DATA
+  
+  
+  test1 = test
+  test1$relevance = as.character(test1$relevance)
+  
+  #Logistic Regression
+  P_LR = predict(LR, newdata = test, type = "response", positive = 1)
+  
+  #Naive Bayes
+  P_NB = predict(NB, test, type = "raw", positive = 1)[,2]
+   
+  #Decision Tree Method 1
+  P_DT = predict(DT, test, type = "prob", control = rpart.control(cp = control_Tree))[,2]
+  
+  #Decision Tree Method 2
+    P_PT = predict(pruned_tree, test, type = "prob", control = rpart.control(cp = BestCP))[,2]
+  
+  #Random Forest
+  P_RF = predict(RF, test, type = "class")
+  
+  #Boosting
+  P_BT = predict(boost_BT, newdata = test, type = "response", n.trees = 1000)
+  
+  df = data.frame(P_LR, P_NB, P_DT, P_PT, P_RF, P_BT, test$relevance)
+  colnames(df) = c("lr", "nb", "dt1", "dt2", "rf", "bt", "relevance")
+  
+  P =predict(y, df, type = "response", positive = 1)
+  P[P>=0.5] = 1
+  P[P<0.5] = 0
+  1-sum(P == test$relevance)/nrow(test)
+```
+
+
+```{r}

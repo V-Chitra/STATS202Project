@@ -1,0 +1,390 @@
+---
+title: "Project_Chitra"
+author: "Chitra Venkatesh"
+date: "July 28, 2018"
+output: html_document
+---
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(corrplot) #for function corrplot()
+library(caret) #for createFolds() in CV
+library(e1071) #for naive Bayes()
+library(rpart) #for decision trees
+library(tree)
+library(randomForest) #for radomForest()
+library(rqPen) #for square()
+```
+
+
+Data separation - 30% separated as test data randomly
+```{r}
+set.seed(5)
+
+Full_Data = read.csv("C://Users//gowth//Desktop//Chitra//STATS 202//Project//Dataset//training.csv")
+
+#index = sample(nrow(Full_Data), 0.3*nrow(Full_Data), replace = FALSE)
+#test = data.frame(Full_Data[index,])
+#trainer = data.frame(Full_Data[-index,])
+
+```
+
+Test and Training data split by Query ID (30% Query IDs for Test)
+
+```{r}
+set.seed(5)
+unique_query = unique(Full_Data$query_id)
+index = sample(length(unique_query), round(length(unique_query)/3), replace = FALSE)
+test_QueryID = unique_query[index]
+train_QueryID = unique_query[-index]
+
+trainer = data.frame(Full_Data[Full_Data$query_id %in% train_QueryID,])
+test = data.frame(Full_Data[Full_Data$query_id %in% test_QueryID,])
+```
+
+
+Inserting two new engineered features - 1. (Name - NumHP) How many homepage results does the query include? 2. (Name - Popularity) How many results have been obtained for a given query divided by the max a query has every had
+```{r}
+FeatureInclusion = function(D, index)
+{
+ #creating blank space in dataframe to include two new features NumHP, Popularity
+ D[,index+1] = rep(0, nrow(D))
+ D[,index+2] = rep(0, nrow(D))
+ D[,index+3] = rep(0, nrow(D))
+ D[,index+4] = rep(0, nrow(D))
+ D[,index+5] = rep(0, nrow(D))
+ D[,index+6] = rep(0, nrow(D))
+ D[,index+7] = rep(0, nrow(D))
+ 
+ names(D)[index+1] = "NumHp"
+ names(D)[index+2] = "Popularity" 
+ names(D)[index+3] = "Sig7_Query"
+ names(D)[index+4] = "Sig8_Query"
+ names(D)[index+5] = "Sig1_Query"
+ names(D)[index+6] = "Sig2_Query"
+ names(D)[index+7] = "SumSig345"
+ 
+ #for every unique query_id, NumHP and Popularity is calculated and appended to dataframe as new columns
+ 
+ unique_query = unique(D$query_id)
+ 
+ 
+ D$SumSig345 = log(1+D$sig3) + log(1+D$sig4) + log(1+D$sig5)
+ D$SumSig345 = (D$SumSig345 - min(D$SumSig345))/(max(D$SumSig345) - min(D$SumSig345))
+ #tempVar = D$SumSig345
+ 
+ #normalizing all signals using z transformation - sig1 to sig8
+ for(i in 5:12)
+ {
+   D[,i] = (D[,i] - mean(D[,i]))/sd(D[,i])
+ }
+ 
+ 
+ for(i in 1:length(unique_query))
+ {
+  D$NumHp[D$query_id == unique_query[i]] = sum(D$is_homepage[D$query_id == unique_query[i]])
+  
+  D$Popularity[D$query_id == unique_query[i]] = nrow(D[D$query_id == unique_query[i],])
+  
+  D$Sig7_Query[D$query_id == unique_query[i]] = mean(D$sig7[D$query_id == unique_query[i]])
+ 
+  D$Sig8_Query[D$query_id == unique_query[i]] = mean(D$sig8[D$query_id == unique_query[i]])
+  
+  D$Sig1_Query[D$query_id == unique_query[i]] = mean(D$sig1[D$query_id == unique_query[i]])
+  
+  D$Sig2_Query[D$query_id == unique_query[i]] = mean(D$sig2[D$query_id == unique_query[i]])
+  
+  #D$SumSig345[D$query_id == unique_query[i]] = mean(D$SumSig345[D$query_id == unique_query[i]])
+ }
+ 
+ D$Popularity = D$Popularity / max(D$Popularity)
+ D$Sig2_Query = D$sig2 - D$Sig2_Query
+ D$Sig1_Query = D$sig1 - D$Sig1_Query
+ D$Sig7_Query = D$sig7 - D$Sig7_Query
+ D$Sig8_Query = D$sig8 - D$Sig8_Query
+ #D$SumSig345 = tempVar - D$SumSig345
+ 
+ 
+ return(D)
+}
+
+
+#including new (engineered) features to training and test data
+relevance = trainer$relevance
+trainer = cbind(FeatureInclusion(trainer,ncol(trainer)-1),relevance)
+
+```
+
+
+INCLUDE THIS SECTION ONLY FOR TESTING - NOT FOR FINAL FILE
+```{r}
+relevance = 0 
+relevance = test$relevance
+test = cbind(FeatureInclusion(test, ncol(test)-1), relevance)
+test$relevance = as.factor(test$relevance)
+test$is_homepage = as.factor(test$is_homepage)
+```
+
+```{r}
+contingencyTable = function(P, relevance)
+{
+  m = matrix(c(0,0,0,0), nrow = 2, ncol = 2)
+  colnames(m) = c("Actual 1", "Actual 0")
+  rownames(m) = c("Predicted 1", "Predicted 0")
+  m[1,1] = sum(P == 1 & relevance ==1)
+  m[2,1] = sum(P == 0 & relevance ==1)
+  m[1,2] = sum(P == 1 & relevance ==0)
+  m[2,2] = sum(P == 0 & relevance ==0)
+  
+  return(m)
+}
+```
+
+
+
+Turning training data into useful format
+
+```{r}
+trainer$relevance = as.factor(trainer$relevance)
+trainer$is_homepage = as.factor(trainer$is_homepage)
+```
+
+
+
+Logistic Regression using 3-fold CV
+
+```{r}
+set.seed(10)
+
+
+Get_accuracy = function(te, LR)
+{
+ P = predict(LR, newdata = te, type = "response", positive = 1)
+ 
+ P[P>=0.5] = 1
+ P[P<0.5] = 0
+ return (sum(P == te$relevance)*1.0/nrow(te))
+}
+
+
+FOLD = 3
+
+k = createFolds(trainer$relevance, FOLD)
+
+errorLR = rep(0,FOLD)
+errorNB = rep(0,FOLD)
+
+for(i in 1:FOLD)
+{
+
+ t = trainer[-k[[i]],]
+ te = trainer[k[[i]],]
+ print(paste('Iteration', i))
+ 
+ #LR = glm(formula = (relevance == 1) ~., family = binomial, data = t)
+ LR = glm(formula = (relevance == 1) ~ query_length + sig1 + sig2 +  sig6 +  sig7 + sig8 + NumHp + Popularity + Sig1_Query + Sig2_Query + Sig7_Query + Sig8_Query + SumSig345, family = binomial, data = t)
+ #LR = glm(formula = (relevance == 1) ~ query_length + sig1 + sig2 + sig6 +  sig7 + sig8 + NumHp + Popularity, family = binomial, data = t)
+ 
+ print(paste('Train Accuracy', Get_accuracy(t, LR)))
+ print(paste('Test Accuracy', Get_accuracy(te, LR)))
+ errorLR[i] = Get_accuracy(te, LR)
+}
+
+mean(errorLR)
+
+
+```
+
+```{r}
+P = predict(LR, newdata = te, type = "response", positive = 1)
+ 
+ P[P>=0.5] = 1
+ P[P<0.5] = 0
+
+summary(LR)
+contingencyTable(P, te$relevance)
+
+```
+
+Understanding relationship using cor plot and ggpairs between different attributes
+
+```{r}
+c = cor(trainer[,3:15])
+c
+corrplot(c, method = "circle")
+ggplot(trainer) + geom_count(aes(y = trainer$query_length*trainer$NumHp, x = trainer$relevance))
+plot(density(trainer$Popularity))
+
+#pairs(train[])
+```
+
+Naive Bayes Method
+
+```{r}
+set.seed(10)
+for(i in 1:FOLD)
+{
+
+ t = trainer[-k[[i]],]
+ te = trainer[k[[i]],]
+ print(paste('Iteration', i))
+ 
+ NB = naiveBayes(t$relevance ~ query_length + sig1 + sig2 + sig6 +  sig7 + sig8 + NumHp + Popularity, data = t)
+ #NB = train(t$relevance ~., data = t, method = "nb")
+ 
+ P = predict(NB, t, type = "class", positive = 1)
+ print(paste('Train Accuracy', (sum(P == t$relevance)*1.0/nrow(t))))
+ 
+ P = predict(NB, te, type = "class", positive = 1)
+ print(paste('Test Accuracy', (sum(P == te$relevance)*1.0/nrow(te))))
+ errorNB[i] = (sum(P == te$relevance)*1.0/nrow(te))
+ }
+
+mean(errorNB)
+
+```
+
+
+Decision Tree
+
+Methiod 1: Only choose those splits that lead to error reduction defined by control otherwise dont split/grow the tree in that direction.
+For different values of control variable, test error is computed by K-folds cross validation. The value of control variable with the least value of error is considered for the final tree.
+
+```{r}
+set.seed(10)
+
+DT_error = rep(0, FOLD)
+threshold = exp(seq(log(0.0001), log(0.01), length.out = 10))
+Error_Control = data.frame(rep(0,length(threshold)),rep(0,length(threshold)))
+colnames(Error_Control) = c("Threshold","Accuracy")
+#1st for-loop is to find the value of control with the best accuracy
+
+for(c in 1:length(threshold))
+{
+ 
+ for(i in 1:FOLD)
+ {
+  t = trainer[-k[[i]],]
+  te = trainer[k[[i]],]
+  print(paste('Iteration', i))
+
+  DT = rpart(relevance ~., data = t, method = "class", control = rpart.control(cp = threshold[c]))
+  #P = predict(DT, t, type = "class", control = rpart.control(cp = 10^(-c)))
+  #print(paste("Training Error", sum(P==t$relevance)/nrow(t)))
+ 
+  P = predict(DT, te, type = "class", control = rpart.control(cp = threshold[c]))
+ print(paste("Test Error", sum(P==te$relevance)/nrow(te)))
+ DT_error[i] = sum(P==te$relevance)/nrow(te)
+ }
+ Error_Control[c,] = c(threshold[c], mean(DT_error))
+}
+
+plot(x = Error_Control[,1], y = Error_Control[,2], log = "x", main = "K-Folds test error with changes in control parameter", xlab = "Value of Threshold", ylab = "Value of Accuracy (1 - K-fold Test Error)", sub = "Blue line indicates lowest k-fold test error for a specific threshold")
+abline(v = Error_Control$Threshold[Error_Control$Accuracy == max(Error_Control$Accuracy)], col = "blue")
+
+control_Tree = Error_Control$Threshold[Error_Control$Accuracy == max(Error_Control$Accuracy)]
+
+```
+
+Decision tress using the chosen control (0.00129)
+
+```{r}
+ DT = rpart(relevance ~., data = trainer, method = "class", control = rpart.control(cp = control_Tree))
+summary(DT)
+plot(DT)
+text(DT, pretty = 0, cex = 0.5)
+```
+
+```{r}
+P = predict(DT, test, type = "class", control = rpart.control(cp = control_Tree))
+print(paste("Test Error", sum(P==test$relevance)/nrow(test)))
+```
+
+
+Method 2: Grow completely, then prune. In this case the cp value with lowest error is 0.0007. The k-fold error for this is
+
+```{r}
+set.seed(5)
+#Tree grown completely with no control parameter
+D_tree2 = rpart(relevance ~., data = trainer, method = "class", control = rpart.control(cp = 0))
+plotcp(D_tree2)
+
+#Tree pruned and best cp value found
+pruned_tree = prune(D_tree2, cp = D_tree2$cptable[which.min(D_tree2$cptable[,"xerror"]),"CP"])
+
+BestCP = D_tree2$cptable[which.min(D_tree2$cptable[,"xerror"]),"CP"] 
+
+plot(pruned_tree,  main = paste("Pruned Tree with best cp =", round(BestCP,5)))
+text(pruned_tree, cex = 0.5)
+```
+
+```{r}
+P = predict(pruned_tree, test, type = "class", control = rpart.control(cp = BestCP))
+print(paste("Test Error", sum(P==test$relevance)/nrow(test)))
+
+```
+
+
+
+```{r}
+set.seed(5)
+Max_m = 6
+error_RF = rep(0, FOLD)
+ErrorRFModels = rep(0, Max_m)
+
+for(m in 2:Max_m)
+{
+for(i in 1:FOLD)
+{
+ t = trainer[-k[[i]],]
+ te = trainer[k[[i]],]
+ print(paste('Iteration', i)) 
+ 
+ RF = randomForest(relevance ~., data = t, mtry = m)
+ #plot(RF)
+ #P = predict(RF, t, type = "class")
+ #print(paste("Training Error: ", sum(P == t$relevance)/nrow(t)))
+ 
+ P = predict(RF, te, type = "class")
+ print(paste("Test Error: ", sum(P == te$relevance)/nrow(te)))
+ error_RF[i] = sum(P == te$relevance)/nrow(te)  
+}
+ErrorRFModels[m] = mean(error_RF)
+}
+ErrorRFModels
+contingencyTable(P, te$relevance)
+#text(RF)
+```
+
+
+```{r}
+set.seed(5)
+RF = randomForest(relevance ~., data = trainer, mtry = 4)
+P = predict(RF, test, type = "class")
+sum(P == test$relevance)/nrow(test)
+
+```
+
+
+
+
+```{r}
+a = rep(0,length(unique_query))
+
+for (i in 1:length(unique_query))
+{
+  a[i] = sum(Full_Data$sig3[Full_Data$query_id == unique_query[i]])/nrow(Full_Data[Full_Data$query_id == unique_query[i],])
+  
+}
+#b = na.omit(a)
+plot(density(a))
+plot(density(trainer$sig8))
+
+boxplot(trainer$Popularity*10 ~ trainer$relevance)
+
+varGreater7HP = data.frame(trainer[trainer$Popularity*10>7,])
+boxplot(log(1+varGreater7HP$SumSig345) ~ varGreater7HP$relevance)
+
+```
+
